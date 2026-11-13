@@ -9,6 +9,7 @@
 #include <cstring>
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <chrono>
 #include <map>
 #include <set>
@@ -103,6 +104,9 @@ struct Pool {
     VmaAllocation shadow_alloc = nullptr;
     VkDeviceAddress shadow_address = 0;
     std::vector<uint64_t> shadow_known;   // (a bit a page)
+    // (and the pages the part being recorded writes back, pinned at its end: their shadow is what they held before the part's GPU
+    // work, not guest memory at its end. shadow_pin, a bit a page, cleared once the part is written back)
+    std::vector<uint64_t> shadow_pinned;
     bool shadow_wanted = false;   // (its write-back was worth one: one given back under VRAM pressure is made again)
 };
 uint64_t mem_rec_value = 0, mem_completed = 0;   // (the recording being made, and the GPU's progress)
@@ -1743,6 +1747,8 @@ void copy_pairs(const CopyPair* pairs, int64_t n) {
 std::unique_ptr<Capture> capture_make();
 void shadow_free(Pool& p);
 void shadow_forget(Pool& p, uint64_t at, uint64_t len);   // (the write-back's diff, below: a range its shadow no longer knows)
+void shadows_part_begin();
+void shadows_before_segments();
 void memory_capture_submit() {
     std::unique_ptr<Capture> c = capture_make();
     if (!c) return;
@@ -3677,6 +3683,7 @@ void memory_begin_submission() {
     mirror_upload = true;
     mirror_synced.clear();
     writebacks.clear();
+    shadows_part_begin();
     imports_give_back();
     if (tex_capture_on()) publish_tex_spans(texture_frame_no());
     if (!mirror_on()) return;
@@ -3708,8 +3715,10 @@ void memory_begin_submission() {
 /// finds its pools synced now (synced_epoch, sync_seg 0). RX_VK_NO_PRESYNC=1: as before
 void memory_sync_mirrors_before_segments() {
     static const bool off = env_on("RX_VK_NO_PRESYNC");
-    if (off || !mirror_on() || !mirror_upload) return;
+    if (!mirror_on() || !mirror_upload) return;
     std::lock_guard lk(pools_mu);
+    shadows_before_segments();   // (the write-back diff's: before every segment too)
+    if (off) return;
     for (auto& kv : imported) {
         Pool& p = kv.second;
         if (p.mstate != Pool::MIRROR_ON || p.synced_epoch == mirror_epoch) continue;
@@ -4049,6 +4058,159 @@ void shadows_forget_written() {
         }
     }
 }
+// ---- the diff's shadow as it was before the part (hookshot, 2026-11-12) ----
+// A page the CPU wrote since was read from guest memory into the shadow at the end of the part, after the GPU's work, and so
+// after whatever the game's threads wrote there meanwhile: they run a frame ahead. Where the GPU left a word as it was, the mirror
+// still held what the part started from, which now differed from the shadow, and the pass wrote that over the CPU's newer word,
+// as the whole copy did. The game's particle emitters write a new particle's record into a free slot of the buffer the effect
+// shaders simulate: those records went, and with them most of Kokiri Forest's pollen (with RX_VK_MIRROR=0, no write-back, it
+// was all there; RX 9070 XT, 2026-11-12). Now the pages of each range a part writes back are pinned at its end
+// (shadows_pin_writebacks): a page its shadow does not know is copied from the mirror into the shadow in the part's uploads,
+// which run after its mirror syncs and before any of its GPU work, and the end of the part reads no pinned page from guest
+// memory. The pass then writes the words the part's GPU work changed, and leaves the rest to whatever the CPU wrote meanwhile.
+// (Whether the shadow knows a page changes only at a part's start and its end, shadows_forget_written: the end, before it reads
+// the reports, sees what the bindings did.) The replay's own writes are in stream order with the GPU's work, so a page the
+// replay wrote during the part is not pinned (shadows_unpin_replay): read from guest memory at the end as before, the GPU's
+// result written over them, as the whole copy does (PR 1109's counters). A submission that goes to a parallel replay's segments
+// pins what it bound before them, ahead of every segment, and nothing after (shadows_before_segments). RX_VK_WB_SNAPSHOT=0:
+// every page the shadow does not know read at the end, as before
+bool wb_snapshot_on() {
+    static const bool on = !getenv("RX_VK_WB_SNAPSHOT") || atoi(getenv("RX_VK_WB_SNAPSHOT")) != 0;
+    return on;
+}
+struct ShadowRun {
+    Pool* p;
+    VkBuffer shadow;
+    uint64_t at, len;   // (offsets in the pool: pages)
+};
+std::vector<ShadowRun> shadow_pins, shadow_snaps;   // (the part's pinned pages, and those of them copied from the mirror; pools_mu)
+uint64_t shadow_pins_off_epoch = 0;   // (a submission that went to parallel segments: no pins for the rest of it)
+int64_t st_wbd_snap_pages = 0;
+// (pages first to last of a bitmap, 64 at a time: f(word, the mask of those pages in it))
+template <class F> void page_words(uint64_t first, uint64_t last, F&& f) {
+    for (uint64_t w = first >> 6; w <= last >> 6; w++) {
+        const uint64_t lo = w == first >> 6 ? first & 63 : 0, hi = w == last >> 6 ? last & 63 : 63;
+        f(w, (hi == 63 ? ~0ull : (1ull << (hi + 1)) - 1) & ~((1ull << lo) - 1));
+    }
+}
+void shadow_run_add(std::vector<ShadowRun>& v, Pool& p, uint64_t at, uint64_t len) {
+    if (!v.empty() && v.back().p == &p && v.back().shadow == p.shadow && v.back().at + v.back().len == at) v.back().len += len;
+    else v.push_back({&p, p.shadow, at, len});
+}
+// (pools_mu held) a range of the pool (offsets) the part writes back: its pages pinned, the ones the shadow does not know copied
+// from the mirror in the part's uploads (shadows_snap_record) and known from then on
+void shadow_pin(Pool& p, uint64_t at, uint64_t len) {
+    if (!len || !p.shadow || !p.mirror) return;
+    if (p.shadow_pinned.size() != p.shadow_known.size()) p.shadow_pinned.assign(p.shadow_known.size(), 0);
+    const uint64_t pool_n = p.hi - p.lo;
+    if (at >= pool_n) return;
+    const uint64_t first = at >> kPageShift, last = (std::min(at + len, pool_n) - 1) >> kPageShift;
+    // (64 pages at a time: the same large buffers are bound written by many dispatches of a part, pinned at the first. The pins
+    // are kept as the ranges that pinned anything, for shadow_pins_clear; the copies page by page, the unknown pages only)
+    bool any = false;
+    page_words(first, last, [&](uint64_t w, uint64_t mask) {
+        uint64_t fresh = mask & ~p.shadow_pinned[w];
+        if (!fresh) return;
+        any = true;
+        p.shadow_pinned[w] |= fresh;
+        // (the unknown ones copied: a known page's shadow is guest memory as it was before the part)
+        for (fresh &= ~p.shadow_known[w]; fresh; fresh &= fresh - 1) {
+            const uint64_t pg = (w << 6) + (uint64_t)std::countr_zero(fresh), page_at = pg << kPageShift;
+            p.shadow_known[w] |= 1ull << (pg & 63);
+            shadow_run_add(shadow_snaps, p, page_at, std::min<uint64_t>(4096, pool_n - page_at));
+            st_wbd_snap_pages++;
+        }
+    });
+    const uint64_t pin_at = first << kPageShift;
+    if (any) shadow_run_add(shadow_pins, p, pin_at, std::min((last + 1) << kPageShift, pool_n) - pin_at);
+}
+bool shadow_is_pinned(const Pool& p, uint64_t pg) {
+    return (pg >> 6) < p.shadow_pinned.size() && (p.shadow_pinned[pg >> 6] >> (pg & 63) & 1);
+}
+// (pools_mu held, at the part's end, before shadows_forget_written reads the reports; and before a parallel replay's segments)
+// the ranges the part writes back, pinned. Not when the submission went to parallel segments: what was bound before them was
+// pinned then, and a range bound in a segment or after them would be copied after the segments' work
+void shadows_pin_writebacks() {
+    if (!wb_snapshot_on() || shadow_pins_off_epoch == mirror_epoch || par_active.load(std::memory_order_relaxed)) return;
+    // (the list has a range for each binding, the same ones many times: overlapping neighbours merged first, as the runs below are;
+    // at the part's end the list is sorted, before the segments it is in binding order)
+    Pool* p = nullptr;
+    uint64_t lo = 0, hi = 0;
+    for (const WriteBack& w : writebacks) {
+        if (w.pool == p && w.lo <= hi && w.hi >= lo) {
+            lo = std::min(lo, w.lo), hi = std::max(hi, w.hi);
+            continue;
+        }
+        if (p) shadow_pin(*p, lo, hi - lo);
+        p = w.pool, lo = w.lo, hi = w.hi;
+    }
+    if (p) shadow_pin(*p, lo, hi - lo);
+}
+// (pools_mu held, at the part's end) the pinned pages' copies from the mirror into the uploads, which run before the part's work
+void shadows_snap_record() {
+    if (shadow_snaps.empty()) return;
+    VkCommandBuffer up = upload_command_buffer();
+    transfer_barrier(up);   // (after the part's mirror syncs, which wrote the pages these copies read)
+    GprofSpan gp(up, "wb snapshot copies (mirror -> shadow, before the part's GPU work)");
+    gp.items = 0;
+    static thread_local std::vector<VkBufferCopy> regions;
+    for (size_t i = 0; i < shadow_snaps.size();) {
+        Pool* p = shadow_snaps[i].p;
+        const VkBuffer shadow = shadow_snaps[i].shadow;
+        regions.clear();
+        for (; i < shadow_snaps.size() && shadow_snaps[i].p == p && shadow_snaps[i].shadow == shadow; i++)
+            regions.push_back({shadow_snaps[i].at, shadow_snaps[i].at, shadow_snaps[i].len});
+        if (p->shadow != shadow || !p->mirror) continue;   // (given back since: its pages are unknown to the next one)
+        vkCmdCopyBuffer(up, p->mirror, p->shadow, (uint32_t)regions.size(), regions.data());
+        gp.items += (int)regions.size();
+        for (const VkBufferCopy& r : regions) gp.bytes += r.size;
+    }
+}
+// (pools_mu held, at the part's end, before shadows_forget_written reads the lists) the pages the replay itself wrote since the
+// part began are not pinned: guest memory has those words from the stream, ahead of the GPU's work after them
+void shadows_unpin_replay() {
+    if (shadow_pins.empty()) return;
+    std::lock_guard lk(shadow_written_mu);
+    if (shadow_written_all) {   // (the replay's pages are lost among the others: none pinned)
+        for (const ShadowRun& r : shadow_pins) std::fill(r.p->shadow_pinned.begin(), r.p->shadow_pinned.end(), 0ull);
+        return;
+    }
+    for (uint32_t pg : shadow_written_by_replay) {
+        const uint64_t a = (uint64_t)pg << kPageShift;
+        auto it = imported.upper_bound(a);
+        if (it == imported.begin()) continue;
+        --it;
+        Pool& p = it->second;
+        if (a >= p.hi) continue;
+        const uint64_t i = (a - p.lo) >> kPageShift;
+        if ((i >> 6) < p.shadow_pinned.size()) p.shadow_pinned[i >> 6] &= ~(1ull << (i & 63));
+    }
+}
+// (pools_mu held) the part's pins let go, at its end and at the next one's start
+void shadow_pins_clear() {
+    for (const ShadowRun& r : shadow_pins) {
+        std::vector<uint64_t>& bits = r.p->shadow_pinned;
+        page_words(r.at >> kPageShift, (r.at + r.len - 1) >> kPageShift, [&](uint64_t w, uint64_t mask) {
+            if (w < bits.size()) bits[w] &= ~mask;
+        });
+    }
+    shadow_pins.clear(), shadow_snaps.clear();
+}
+// (pools_mu held, memory_begin_submission) a part begins: the pages the CPU wrote since the last write-back are unknown to the
+// shadows before its ranges are pinned, so that their shadow is the part's starting point (the mirror after its syncs), not a
+// page older
+void shadows_part_begin() {
+    shadow_pins_clear();
+    if (wb_snapshot_on() && wb_diff_on() && shadow_bytes) shadows_forget_written();
+}
+// (pools_mu held, memory_sync_mirrors_before_segments) a submission going to parallel segments: the ranges it wrote before them
+// pinned and copied in the uploads that run before every segment (they stay pinned for its end), and none pinned after
+void shadows_before_segments() {
+    shadows_pin_writebacks();
+    shadows_snap_record();
+    shadow_snaps.clear();
+    shadow_pins_off_epoch = mirror_epoch;
+}
 // (the pass's pipeline: 24 bytes of push constants and no descriptors, its buffers by address; made once)
 struct WbdPipe {
     bool tried = false;
@@ -4275,11 +4437,13 @@ void memory_end_submission(VkCommandBuffer cmd, uint64_t part) {
                  (long long)st_sync_gpu_pages, (long long)st_sync_gpu_live, (long long)st_prot_kept.load());
             l_cap = st_sync_cap_pages, l_live = st_sync_live_pages, l_old = st_sync_old_pages;
             if (shadow_bytes || st_wbd_runs)
-                logf("vk: write-back diff (600 submits): %lld runs, %.1f MB compared; %lld pages read into the shadows; %llu MB of shadows; "
+                logf("vk: write-back diff (600 submits): %lld runs, %.1f MB compared; %lld pages read into the shadows, %lld copied from the "
+                     "mirrors before their part (RX_VK_WB_SNAPSHOT); %llu MB of shadows; "
                      "pages the shadows knew that the CPU wrote: %lld in captures, %lld only in the collection, %lld only by the replay itself",
-                     (long long)st_wbd_runs, st_wbd_bytes / 1048576.0, (long long)st_wbd_fill_pages, (unsigned long long)(shadow_bytes >> 20),
+                     (long long)st_wbd_runs, st_wbd_bytes / 1048576.0, (long long)st_wbd_fill_pages, (long long)st_wbd_snap_pages,
+                     (unsigned long long)(shadow_bytes >> 20),
                      (long long)st_wbd_known_game, (long long)st_wbd_known_collected, (long long)st_wbd_known_replay);
-            st_wbd_runs = st_wbd_bytes = st_wbd_fill_pages = 0;
+            st_wbd_runs = st_wbd_bytes = st_wbd_fill_pages = st_wbd_snap_pages = 0;
             st_wbd_known_game = st_wbd_known_collected = st_wbd_known_replay = 0;
             if (wbd_observe_on()) {
                 logf("vk: write-back observations (completed since last report): %llu batches, %llu chunks, %llu changed; "
@@ -4347,7 +4511,10 @@ void memory_end_submission(VkCommandBuffer cmd, uint64_t part) {
         std::vector<VkBufferCopy> runs;
         // (the write-back's diff: the runs of pools with a shadow, as chunks of 64 KB at most, for one pass after the loop)
         const bool diff = wb_diff_on() && wbd_pipe_ready();
-        if (diff) shadows_forget_written(), shadows_reap(), shadows_check_room();
+        // (the ranges pinned, and the copies of their pages from the mirror recorded into the part's uploads, before the reports are
+        // read: shadow_pin)
+        if (diff) shadows_pin_writebacks(), shadows_snap_record(), shadows_unpin_replay(), shadows_forget_written(), shadows_reap(),
+            shadows_check_room();
         static thread_local std::vector<WbdChunk> chunks;
         struct ChunkSrc { Pool* p; uint64_t at, len; };
         static thread_local std::vector<ChunkSrc> chunk_src;   // (for the whole copy, when no table is free)
@@ -4382,13 +4549,14 @@ void memory_end_submission(VkCommandBuffer cmd, uint64_t part) {
                 odd.clear();
                 for (const VkBufferCopy& r : runs)
                     if ((r.dstOffset | r.size) & 3) odd.push_back(r);
-                // the pages of the runs the shadow does not know: from guest memory, whole, first
+                // the pages of the runs the shadow does not know: from guest memory, whole, first. Not a pinned one: its shadow is
+                // what the part started from (shadow_pin)
                 fills.clear();
                 const uint64_t pool_n = p->hi - p->lo;
                 for (const VkBufferCopy& r : runs)
                     for (uint64_t pg = r.dstOffset >> kPageShift; !((r.dstOffset | r.size) & 3) && pg <= (r.dstOffset + r.size - 1) >> kPageShift; pg++) {
                         uint64_t& bits = p->shadow_known[pg >> 6];
-                        if (bits & (1ull << (pg & 63))) continue;
+                        if (bits & (1ull << (pg & 63)) || shadow_is_pinned(*p, pg)) continue;
                         bits |= 1ull << (pg & 63);
                         const uint64_t at = pg << kPageShift, len = std::min<uint64_t>(4096, pool_n - at);
                         if (!fills.empty() && fills.back().srcOffset + fills.back().size == at)
@@ -4487,6 +4655,7 @@ void memory_end_submission(VkCommandBuffer cmd, uint64_t part) {
         transfer_barrier(cmd);
         writebacks.clear();
     }
+    shadow_pins_clear();
     // (what this submission synced is current as of now: the GPU's own writes, stamped while it was recorded, are
     // in the mirror and written back; CPU writes collected at the next submission get a newer generation)
     for (Pool* p : mirror_synced) p->synced_gen = gen_now;
